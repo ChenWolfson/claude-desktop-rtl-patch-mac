@@ -45,7 +45,15 @@ The Windows patch only has to edit files. On macOS, three extra problems get in 
    the copy, which carries the necessary permission.
 3. **Code signing.** Patching the bundle invalidates Anthropic's signature, and macOS requires
    every binary in a bundle to share one Team ID. The script re-signs everything ad-hoc
-   (Team ID `-`), inside out: binaries → frameworks → helper apps → the bundle itself.
+   (Team ID `-`), inside out: binaries → nested bundles, deepest first → the bundle itself.
+
+   Signing is done with `--preserve-metadata=entitlements,flags,runtime`. Without it,
+   `codesign` silently strips the hardened runtime *and every entitlement* — including
+   `allow-jit` and the TCC-gated camera, microphone, location and photos entitlements. Since
+   the identity also changes from Anthropic's Team ID to ad-hoc, macOS would treat the result
+   as a different app and lose privacy permissions you had already granted. If the bundle
+   fails to verify with the runtime preserved, the script retries without it and says so,
+   rather than reporting success either way.
 
 ---
 

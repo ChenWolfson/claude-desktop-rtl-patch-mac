@@ -298,32 +298,94 @@ install_patch() {
     resign_app
 }
 
+# --preserve-metadata is what keeps this from quietly downgrading the app.
+# Signing without it strips the hardened runtime (flags=0x10000) and *every*
+# entitlement — including allow-jit and the TCC-gated camera, microphone,
+# location and photos entitlements. Because the identity also changes from
+# Anthropic's Team ID to ad-hoc, macOS would treat the result as a different
+# app and re-prompt for, or lose, privacy permissions already granted.
+#
+# 'requirements' is deliberately NOT preserved: the original designated
+# requirement names Team ID Q6L2SF6YDW, which an ad-hoc signature can never
+# satisfy. Letting codesign generate a fresh one is the correct behaviour here.
+SIGN_FULL=(--sign - --force --preserve-metadata=entitlements,flags,runtime)
+
+# Fallback. Hardened runtime enables library validation, which requires loaded
+# libraries to share the main binary's Team ID — something ad-hoc signatures do
+# not have. If the bundle fails to verify with the runtime preserved, we drop it
+# and keep the entitlements, which is still strictly better than stripping both.
+SIGN_NO_RUNTIME=(--sign - --force --preserve-metadata=entitlements)
+
+# Flags for the current pass. Initialised rather than left empty: macOS ships
+# bash 3.2, where expanding an empty array under `set -u` is an error.
+SIGN_FLAGS=("${SIGN_FULL[@]}")
+
+sign_one() {
+    local target="$1" label="$2" err
+    if err=$(codesign "${SIGN_FLAGS[@]}" "$target" 2>&1); then
+        log "Signed: $label"
+        return 0
+    fi
+    warn "Failed to sign $label — ${err//$'\n'/ }"
+    return 1
+}
+
+# Signs the whole bundle inside out. Returns the number of failures.
+sign_bundle_pass() {
+    local failures=0 f b
+
+    # Mach-O binaries: executables, dylibs and .node native modules.
+    while IFS= read -r f; do
+        file "$f" 2>/dev/null | grep -q "Mach-O" || continue
+        sign_one "$f" "$(basename "$f")" || failures=$((failures + 1))
+    done < <(find "$CLAUDE_APP" -type f \( -name "*.dylib" -o -perm +111 \))
+
+    # Frameworks and helper apps, deepest first — nested code must be signed
+    # before whatever contains it. Note the absence of --deep: Apple documents
+    # it as a verification tool, not a signing one, and walking the bundle by
+    # hand (as here) is the supported way to sign nested code.
+    while IFS= read -r b; do
+        sign_one "$b" "$(basename "$b")" || failures=$((failures + 1))
+    done < <(find "$CLAUDE_APP" \( -name "*.framework" -o -name "*.app" \) ! -path "$CLAUDE_APP" \
+             | awk -F/ '{ print NF "\t" $0 }' | sort -rn | cut -f2-)
+
+    # Finally the outer bundle.
+    sign_one "$CLAUDE_APP" "$(basename "$CLAUDE_APP")" || failures=$((failures + 1))
+
+    return "$failures"
+}
+
 resign_app() {
     # macOS requires all binaries in the bundle to share the same Team ID.
     # Patching the ASAR invalidates Anthropic's original code signature,
     # so we re-sign everything ad-hoc (Team ID = "-") from the inside out.
+    local failures=0 verify_err
 
-    # Sign all Mach-O binaries (executables + dylibs + .node native modules)
-    find "$CLAUDE_APP" -type f \( -name "*.dylib" -o -perm +111 \) | while read -r f; do
-        file "$f" 2>/dev/null | grep -q "Mach-O" && \
-            codesign --sign - --force "$f" 2>/dev/null && log "Signed: $(basename "$f")"
-    done
+    SIGN_FLAGS=("${SIGN_FULL[@]}")
+    sign_bundle_pass || failures=$?
 
-    # Sign frameworks (deepest first via find, then explicit pass)
-    find "$CLAUDE_APP" -name "*.framework" | while read -r fw; do
-        codesign --sign - --force --deep "$fw" 2>/dev/null
-    done
+    if verify_err=$(codesign --verify --strict "$CLAUDE_APP" 2>&1); then
+        if [[ $failures -eq 0 ]]; then
+            success "App bundle re-signed and verified (entitlements and hardened runtime preserved)."
+        else
+            warn "Bundle verifies, but $failures item(s) failed to sign — see the warnings above."
+        fi
+    else
+        warn "Verification failed with the hardened runtime preserved:"
+        printf '      %s\n' "$verify_err"
+        warn "Retrying without it (entitlements are still preserved)..."
 
-    # Sign helper .app bundles
-    find "$CLAUDE_APP" -name "*.app" -not -path "$CLAUDE_APP" | while read -r a; do
-        codesign --sign - --force --deep "$a" 2>/dev/null
-    done
+        failures=0
+        SIGN_FLAGS=("${SIGN_NO_RUNTIME[@]}")
+        sign_bundle_pass || failures=$?
 
-    # Final pass: sign the whole bundle
-    codesign --sign - --force --deep "$CLAUDE_APP" 2>/dev/null
-    codesign -v "$CLAUDE_APP" 2>/dev/null \
-        && success "App bundle re-signed successfully." \
-        || warn "Re-signing completed (validation warning is normal with ad-hoc signatures)."
+        if verify_err=$(codesign --verify --strict "$CLAUDE_APP" 2>&1); then
+            warn "Verified, but the hardened runtime had to be dropped to get there."
+        else
+            printf '      %s\n' "$verify_err"
+            die "Bundle does not verify. Claude Desktop may not launch — reinstall it from https://claude.ai/download"
+        fi
+    fi
 
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
