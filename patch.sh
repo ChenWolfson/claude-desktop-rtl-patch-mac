@@ -38,6 +38,18 @@ RTL_JS='// --- CLAUDE RTL PATCH START ---
     if (typeof document === '"'"'undefined'"'"') return;
     try {
         var WRITING_SEL = '"'"'[data-testid="chat-input"]'"'"';
+        // Broad editor detector, used by every skip-guard below.
+        // The chat input testid changes between Claude Desktop versions. When it
+        // does, a WRITING_SEL-only guard stops matching and we start stamping
+        // dir/style onto nodes ProseMirror owns. ProseMirror then redraws, which
+        // re-fires our observer, which stamps again -- an infinite loop that
+        // freezes the app. It reproduces most reliably by typing "-" then a
+        // digit, since that makes ProseMirror restructure the line into a list.
+        var EDITOR_SEL = '"'"'[data-testid="chat-input"], [contenteditable="true"], [contenteditable=""], [contenteditable="plaintext-only"], .ProseMirror, [role="textbox"]'"'"';
+        // The composer toolbar positions the send button with logical insets
+        // (end-*). Flipping an ancestor to dir="rtl" resolves that offset to the
+        // opposite physical edge, clipping the button and breaking Enter-to-send.
+        var COMPOSER_SEL = '"'"'form, [data-testid="chat-input-container"], [class*="composer"], [class*="Composer"]'"'"';
         function isRTL(c) { var code = c.charCodeAt(0); return (code >= 0x0590 && code <= 0x05FF) || (code >= 0x0600 && code <= 0x06FF) || (code >= 0x0750 && code <= 0x077F) || (code >= 0x08A0 && code <= 0x08FF); }
         function hasRTL(text) { if (!text) return false; for (var i = 0; i < text.length; i++) { if (isRTL(text[i])) return true; } return false; }
         function firstStrong(text) { if (!text) return null; for (var i = 0; i < text.length; i++) { if (isRTL(text[i])) return '"'"'rtl'"'"'; if (/[a-zA-Z]/.test(text[i])) return '"'"'ltr'"'"'; } return null; }
@@ -46,16 +58,16 @@ RTL_JS='// --- CLAUDE RTL PATCH START ---
         function detectElDir(el) { var full = el.textContent || '"'"''"'"'; if (!hasRTL(full)) return null; var noCode = textWithoutCode(el); var d = firstStrong(noCode); if (d === '"'"'rtl'"'"') return '"'"'rtl'"'"'; var stripped = stripLeadingLTR(noCode); d = firstStrong(stripped); if (d === '"'"'rtl'"'"') return '"'"'rtl'"'"'; return '"'"'rtl'"'"'; }
         function detectTextDir(text) { if (!text || !text.trim()) return null; var d = firstStrong(text); if (d === '"'"'rtl'"'"') return '"'"'rtl'"'"'; if (!hasRTL(text)) return '"'"'ltr'"'"'; var stripped = stripLeadingLTR(text); d = firstStrong(stripped); if (d === '"'"'rtl'"'"') return '"'"'rtl'"'"'; return '"'"'rtl'"'"'; }
         function qsa(root, sel) { var base = root.querySelectorAll ? root : document; var els = Array.from(base.querySelectorAll(sel)); if (root.matches && root.matches(sel)) els.unshift(root); return els; }
-        function forceCodeLTR(root) { qsa(root, '"'"'pre, .code-block__code'"'"').forEach(function(b) { b.dir = '"'"'ltr'"'"'; b.style.textAlign = '"'"'left'"'"'; b.style.unicodeBidi = '"'"'embed'"'"'; }); qsa(root, '"'"'code'"'"').forEach(function(c) { if (!c.closest('"'"'pre'"'"') && !c.closest('"'"'.code-block__code'"'"')) c.dir = '"'"'ltr'"'"'; }); }
+        function forceCodeLTR(root) { qsa(root, '"'"'pre, .code-block__code'"'"').forEach(function(b) { if (b.closest(EDITOR_SEL)) return; b.dir = '"'"'ltr'"'"'; b.style.textAlign = '"'"'left'"'"'; b.style.unicodeBidi = '"'"'embed'"'"'; }); qsa(root, '"'"'code'"'"').forEach(function(c) { if (c.closest(EDITOR_SEL)) return; if (!c.closest('"'"'pre'"'"') && !c.closest('"'"'.code-block__code'"'"')) c.dir = '"'"'ltr'"'"'; }); }
         function processText(root) {
             qsa(root, '"'"'p, li, h1, h2, h3, h4, h5, h6, blockquote, td, th, summary, label, dt, dd'"'"').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('"'"'pre'"'"') || el.closest('"'"'.code-block__code'"'"')) return;
+                if (el.closest(EDITOR_SEL) || el.closest('"'"'pre'"'"') || el.closest('"'"'.code-block__code'"'"')) return;
                 var dir = detectElDir(el);
                 if (dir) { el.dir = dir; el.style.direction = dir; if (el.tagName === '"'"'LI'"'"') { el.style.listStylePosition = (dir === '"'"'rtl'"'"') ? '"'"'inside'"'"' : '"'"''"'"'; var pl = el.closest('"'"'ul, ol'"'"'); if (pl && dir === '"'"'rtl'"'"' && !pl.hasAttribute('"'"'dir'"'"')) { pl.dir = '"'"'rtl'"'"'; pl.style.direction = '"'"'rtl'"'"'; var pLeft = getComputedStyle(pl).paddingLeft; if (parseFloat(pLeft) > 0) { pl.style.paddingRight = pLeft; pl.style.paddingLeft = '"'"'0'"'"'; } } } }
                 else { if (el.hasAttribute('"'"'dir'"'"')) el.removeAttribute('"'"'dir'"'"'); el.style.direction = '"'"''"'"'; if (el.tagName === '"'"'LI'"'"') el.style.listStylePosition = '"'"''"'"'; }
             });
             qsa(root, '"'"'ul, ol'"'"').forEach(function(el) {
-                if (el.closest(WRITING_SEL) || el.closest('"'"'pre'"'"')) return;
+                if (el.closest(EDITOR_SEL) || el.closest('"'"'pre'"'"')) return;
                 var dir = detectElDir(el);
                 if (dir === '"'"'rtl'"'"') { el.dir = '"'"'rtl'"'"'; el.style.direction = '"'"'rtl'"'"'; var pl = getComputedStyle(el).paddingLeft; if (parseFloat(pl) > 0) { el.style.paddingRight = pl; el.style.paddingLeft = '"'"'0'"'"'; } }
                 else { if (el.hasAttribute('"'"'dir'"'"')) el.removeAttribute('"'"'dir'"'"'); el.style.direction = '"'"''"'"'; el.style.paddingRight = '"'"''"'"'; el.style.paddingLeft = '"'"''"'"'; }
@@ -63,7 +75,7 @@ RTL_JS='// --- CLAUDE RTL PATCH START ---
         }
         function processContainers(root) {
             qsa(root, '"'"'div, span, button, a, label'"'"').forEach(function(el) {
-                if (el.closest('"'"'pre'"'"') || el.closest('"'"'code'"'"') || el.closest(WRITING_SEL)) return;
+                if (el.closest('"'"'pre'"'"') || el.closest('"'"'code'"'"') || el.closest(EDITOR_SEL) || el.closest(COMPOSER_SEL)) return;
                 if (el.querySelector('"'"'p, div, ul, ol, h1, h2, h3, h4, h5, h6, pre, table'"'"')) return;
                 if (/^(P|LI|H[1-6]|BLOCKQUOTE|TD|TH|UL|OL)$/.test(el.tagName)) return;
                 var text = (el.textContent || '"'"''"'"').trim();

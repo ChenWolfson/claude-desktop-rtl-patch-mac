@@ -6,8 +6,9 @@ Claude Desktop renders all text left-to-right. If you write in Hebrew or Arabic,
 jumps to the wrong side, lists indent backwards, and mixed Hebrew/English lines come out
 scrambled. This patch fixes that — while keeping code blocks correctly left-to-right.
 
-This is a macOS port of [shraga100/claude-desktop-rtl-patch](https://github.com/shraga100/claude-desktop-rtl-patch),
-which targets the Windows build.
+It is a macOS port of [shraga100/claude-desktop-rtl-patch](https://github.com/shraga100/claude-desktop-rtl-patch),
+which targets the Windows build. It is not the only RTL patch for Claude Desktop —
+see [Alternatives](#alternatives) before picking one.
 
 ---
 
@@ -22,6 +23,13 @@ The patch injects a small JavaScript payload into Claude Desktop's Electron bund
 - **Live input direction** — the chat box switches direction as you type, per message.
 - **Incremental updates** — a `MutationObserver` re-processes only changed subtrees while
   Claude streams a response, instead of re-scanning the whole document.
+- **Never touches the editor's own DOM** — every skip-guard matches any `contenteditable`,
+  `.ProseMirror` or `[role="textbox"]`, not just one `data-testid`. Stamping direction on
+  nodes ProseMirror owns makes it redraw, which re-fires the observer, which stamps again —
+  an infinite loop that freezes the app. The composer toolbar is excluded too, so the send
+  button keeps its position and Enter-to-send keeps working.
+- **Safe in Node contexts** — injection is limited to the two renderer bundles, and the
+  payload returns immediately when there is no `document`. MCP servers are unaffected.
 
 ---
 
@@ -38,6 +46,23 @@ The Windows patch only has to edit files. On macOS, three extra problems get in 
 3. **Code signing.** Patching the bundle invalidates Anthropic's signature, and macOS requires
    every binary in a bundle to share one Team ID. The script re-signs everything ad-hoc
    (Team ID `-`), inside out: binaries → frameworks → helper apps → the bundle itself.
+
+---
+
+## Alternatives
+
+Other projects solve the same problem. Pick whichever fits — they are all MIT:
+
+| Project | Platforms | Approach |
+| --- | --- | --- |
+| [m4tinbeigi-official/claude-rtl-patcher](https://github.com/m4tinbeigi-official/claude-rtl-patcher) | macOS, Windows, Linux | Node package (`npx claude-rtl-patcher`). The most actively maintained option, with Hebrew/Arabic/Persian docs and font support. |
+| [shraga100/claude-desktop-rtl-patch](https://github.com/shraga100/claude-desktop-rtl-patch) | Windows | PowerShell. The original this port is based on. |
+| [WebDud/ClaudeRTL](https://github.com/WebDud/ClaudeRTL) | any | A DevTools snippet — nothing written to disk, no re-signing. Has to be re-pasted each launch. |
+
+**Why this one exists:** a single self-contained bash script with no npm install and
+no package to trust — you can read all of it in one sitting before running it. If you
+would rather not audit a script at all, WebDud's snippet touches nothing on disk and is
+the most conservative option available.
 
 ---
 
@@ -94,6 +119,12 @@ drag it over `/Applications/Claude.app`.
 - **Version-dependent.** The injection targets specific bundle paths
   (`.vite/build/mainView.js` and `MainWindowPage-*.js`). A future release could rename these,
   in which case the script reports that it found nothing to inject.
+- **Artifact preview panes.** On a Hebrew-language macOS install, Chromium may give the UI an
+  RTL layout of its own, independent of this patch. If artifact previews render mirrored, that
+  is upstream Chromium behavior rather than the injected script — see
+  [shraga100#20](https://github.com/shraga100/claude-desktop-rtl-patch/issues/20), where the
+  Windows patch works around it with `force-ui-direction=ltr`. Not reproduced on macOS yet;
+  reports welcome.
 - Verified against Claude Desktop **1.26832.0**.
 
 ---
@@ -105,7 +136,7 @@ Claude Desktop לא תומך בעברית — סימני פיסוק קופצים
 מיושרים לשמאל כמו שצריך.
 
 זהו פורט ל-macOS של [הפאטץ' של shraga100](https://github.com/shraga100/claude-desktop-rtl-patch)
-לגרסת Windows.
+לגרסת Windows. יש גם פתרונות אחרים לאותה בעיה — ראו [Alternatives](#alternatives) למעלה.
 
 **התקנה:**
 
@@ -126,6 +157,12 @@ cd claude-desktop-rtl-patch-mac
 
 - Original Windows patch — [shraga100](https://github.com/shraga100/claude-desktop-rtl-patch) (MIT)
 - macOS port — [Chen Wolfson](https://github.com/ChenWolfson)
+
+The editor and composer skip-guards come from the upstream analysis in
+[shraga100#33](https://github.com/shraga100/claude-desktop-rtl-patch/issues/33) and
+[#28](https://github.com/shraga100/claude-desktop-rtl-patch/issues/28) — thanks to
+[@amichayraviv](https://github.com/amichayraviv) and [@kfirj1986](https://github.com/kfirj1986)
+for diagnosing them on the Windows side.
 
 ## License
 
