@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# Patch build artifacts
+app.asar
+app.asar.patched
+*.asar
+claude_rtl_*/
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Local / secrets
+.env
+.env.*
+*.local
