@@ -10,8 +10,8 @@
 #   git clone https://github.com/ChenWolfson/claude-desktop-rtl-patch-mac.git
 #   cd claude-desktop-rtl-patch-mac && ./patch.sh
 #
-# This script modifies files inside /Applications/Claude.app and re-signs the
-# bundle. Read it before running it.
+# This script modifies files inside /Applications/Claude.app. Read it before
+# running it.
 # =============================================================================
 
 set -euo pipefail
@@ -181,17 +181,38 @@ check_prerequisites() {
     success "All prerequisites satisfied."
 }
 
+# PIDs of the main app process, and of anything else running from the bundle.
+# `pgrep -x Claude` only ever matched Contents/MacOS/Claude, so every helper --
+# including the ones that host Claude Code -- went undetected and the script
+# announced "Claude stopped" while binaries from the bundle were still live.
+main_pids()   { pgrep -f "^$CLAUDE_APP/Contents/MacOS/Claude$" 2>/dev/null || true; }
+helper_pids() { pgrep -f "^$CLAUDE_APP/" 2>/dev/null | grep -vxF "$(main_pids)" 2>/dev/null || true; }
+
 quit_claude() {
     step "Quitting Claude Desktop..."
     osascript -e 'tell application "Claude" to quit' 2>/dev/null || true
     pkill -x "Claude" 2>/dev/null || true
 
-    local waited=0 max_wait=20   # 20 * 0.5s = 10s cap
-    while pgrep -x "Claude" >/dev/null 2>&1 && [[ $waited -lt $max_wait ]]; do
+    local waited=0
+    while [[ -n "$(main_pids)" && $waited -lt 20 ]]; do   # 20 * 0.5s = 10s cap
         sleep 0.5
-        ((waited++))
+        waited=$((waited + 1))
     done
-    [[ $waited -ge $max_wait ]] && warn "Claude still running after 10s — proceeding anyway."
+
+    # Replacing app.asar under a live main process corrupts the install, so this
+    # is fatal rather than a warning.
+    [[ -n "$(main_pids)" ]] && die "Claude Desktop is still running after 10s. Quit it and try again."
+
+    # Helpers are a different matter: they do not map app.asar, so patching over
+    # them is safe. Worth naming, because one of them may be hosting the very
+    # terminal this is running in.
+    local helpers; helpers=$(helper_pids)
+    if [[ -n "$helpers" ]]; then
+        warn "Still running from the bundle (harmless, but they keep the old code):"
+        while read -r p; do
+            [[ -n "$p" ]] && warn "    $(basename "$(ps -o comm= -p "$p" 2>/dev/null)") (pid $p)"
+        done <<< "$helpers"
+    fi
     success "Claude stopped."
 }
 
@@ -294,98 +315,55 @@ install_patch() {
     rm -rf "$tmp_plist_dir"
     [[ $updated -gt 0 ]] && success "Updated $updated plist file(s)." || warn "No plist files needed updating."
 
-    step "Phase 7: Re-signing app bundle with ad-hoc signature..."
-    resign_app
+    step "Phase 7: Verifying the patch..."
+    verify_patch
 }
 
-# --preserve-metadata is what keeps this from quietly downgrading the app.
-# Signing without it strips the hardened runtime (flags=0x10000) and *every*
-# entitlement — including allow-jit and the TCC-gated camera, microphone,
-# location and photos entitlements. Because the identity also changes from
-# Anthropic's Team ID to ad-hoc, macOS would treat the result as a different
-# app and re-prompt for, or lose, privacy permissions already granted.
+# The patch only replaces app.asar -- an unsigned resource -- and rewrites the
+# ASAR integrity hash in Info.plist. No Mach-O binary is modified, so every
+# executable keeps its original Anthropic signature and the app launches
+# normally.
 #
-# 'requirements' is deliberately NOT preserved: the original designated
-# requirement names Team ID Q6L2SF6YDW, which an ad-hoc signature can never
-# satisfy. Letting codesign generate a fresh one is the correct behaviour here.
-SIGN_FULL=(--sign - --force --preserve-metadata=entitlements,flags,runtime)
+# Earlier versions re-signed the whole bundle ad-hoc here, on the assumption
+# that patching invalidated the signature. It does not, and the re-signing never
+# actually worked: every codesign call failed with "Operation not permitted",
+# because a shell has no App Management right over another app's bundle -- the
+# same restriction that forces finder_copy above. The failures were hidden by
+# 2>/dev/null, so the step reported success for months while doing nothing.
+#
+# Not re-signing is also the better outcome. The bundle keeps Anthropic's real
+# Developer ID signature and its hardened runtime, instead of being downgraded
+# to an ad-hoc signature with its entitlements stripped.
+#
+# One visible consequence: `codesign --verify` reports a modified Info.plist,
+# because the resource seal no longer matches. macOS does not consult that seal
+# when launching an already-installed, unquarantined app.
+verify_patch() {
+    local ok=1 actual team
 
-# Fallback. Hardened runtime enables library validation, which requires loaded
-# libraries to share the main binary's Team ID — something ad-hoc signatures do
-# not have. If the bundle fails to verify with the runtime preserved, we drop it
-# and keep the entitlements, which is still strictly better than stripping both.
-SIGN_NO_RUNTIME=(--sign - --force --preserve-metadata=entitlements)
-
-# Flags for the current pass. Initialised rather than left empty: macOS ships
-# bash 3.2, where expanding an empty array under `set -u` is an error.
-SIGN_FLAGS=("${SIGN_FULL[@]}")
-
-sign_one() {
-    local target="$1" label="$2" err
-    if err=$(codesign "${SIGN_FLAGS[@]}" "$target" 2>&1); then
-        log "Signed: $label"
-        return 0
-    fi
-    warn "Failed to sign $label — ${err//$'\n'/ }"
-    return 1
-}
-
-# Signs the whole bundle inside out. Returns the number of failures.
-sign_bundle_pass() {
-    local failures=0 f b
-
-    # Mach-O binaries: executables, dylibs and .node native modules.
-    while IFS= read -r f; do
-        file "$f" 2>/dev/null | grep -q "Mach-O" || continue
-        sign_one "$f" "$(basename "$f")" || failures=$((failures + 1))
-    done < <(find "$CLAUDE_APP" -type f \( -name "*.dylib" -o -perm +111 \))
-
-    # Frameworks and helper apps, deepest first — nested code must be signed
-    # before whatever contains it. Note the absence of --deep: Apple documents
-    # it as a verification tool, not a signing one, and walking the bundle by
-    # hand (as here) is the supported way to sign nested code.
-    while IFS= read -r b; do
-        sign_one "$b" "$(basename "$b")" || failures=$((failures + 1))
-    done < <(find "$CLAUDE_APP" \( -name "*.framework" -o -name "*.app" \) ! -path "$CLAUDE_APP" \
-             | awk -F/ '{ print NF "\t" $0 }' | sort -rn | cut -f2-)
-
-    # Finally the outer bundle.
-    sign_one "$CLAUDE_APP" "$(basename "$CLAUDE_APP")" || failures=$((failures + 1))
-
-    return "$failures"
-}
-
-resign_app() {
-    # macOS requires all binaries in the bundle to share the same Team ID.
-    # Patching the ASAR invalidates Anthropic's original code signature,
-    # so we re-sign everything ad-hoc (Team ID = "-") from the inside out.
-    local failures=0 verify_err
-
-    SIGN_FLAGS=("${SIGN_FULL[@]}")
-    sign_bundle_pass || failures=$?
-
-    if verify_err=$(codesign --verify --strict "$CLAUDE_APP" 2>&1); then
-        if [[ $failures -eq 0 ]]; then
-            success "App bundle re-signed and verified (entitlements and hardened runtime preserved)."
-        else
-            warn "Bundle verifies, but $failures item(s) failed to sign — see the warnings above."
-        fi
+    if grep -aq "CLAUDE RTL PATCH START" "$ASAR_PATH"; then
+        success "RTL payload is present in app.asar."
     else
-        warn "Verification failed with the hardened runtime preserved:"
-        printf '      %s\n' "$verify_err"
-        warn "Retrying without it (entitlements are still preserved)..."
-
-        failures=0
-        SIGN_FLAGS=("${SIGN_NO_RUNTIME[@]}")
-        sign_bundle_pass || failures=$?
-
-        if verify_err=$(codesign --verify --strict "$CLAUDE_APP" 2>&1); then
-            warn "Verified, but the hardened runtime had to be dropped to get there."
-        else
-            printf '      %s\n' "$verify_err"
-            die "Bundle does not verify. Claude Desktop may not launch — reinstall it from https://claude.ai/download"
-        fi
+        warn "RTL payload NOT found in app.asar."
+        ok=0
     fi
+
+    actual=$(python3 - "$ASAR_PATH" <<< "$PY_COMPUTE_HASH")
+    if grep -q "$actual" "$CLAUDE_APP/Contents/Info.plist" 2>/dev/null; then
+        success "ASAR integrity hash matches Info.plist."
+    else
+        warn "ASAR integrity hash does not match Info.plist — Claude will refuse to start."
+        ok=0
+    fi
+
+    team=$(codesign -dv "$CLAUDE_APP" 2>&1 | sed -n 's/^TeamIdentifier=//p')
+    if [[ -n "$team" && "$team" != "not set" ]]; then
+        success "Code signature untouched (Team $team)."
+    else
+        warn "This bundle has no Team ID — something has re-signed it ad-hoc."
+    fi
+
+    [[ $ok -eq 1 ]] || die "Patch did not apply cleanly. Reinstall Claude Desktop from https://claude.ai/download and try again."
 
     echo ""
     echo -e "${GREEN}╔══════════════════════════════════════════════════╗${NC}"
@@ -394,6 +372,9 @@ resign_app() {
     echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${YELLOW}  ⚠️  Run this script again after each Claude Desktop update.${NC}"
+    echo ""
+    echo -e "${CYAN}  Note: 'codesign --verify' will report a modified Info.plist.${NC}"
+    echo -e "${CYAN}  That is expected — see the comment above verify_patch().${NC}"
     echo ""
 }
 

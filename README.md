@@ -43,17 +43,22 @@ The Windows patch only has to edit files. On macOS, three extra problems get in 
 2. **`com.apple.macl` protection.** macOS blocks direct writes into app bundles, even as your
    own user. The script works around this by driving **Finder** via AppleScript to perform
    the copy, which carries the necessary permission.
-3. **Code signing.** Patching the bundle invalidates Anthropic's signature, and macOS requires
-   every binary in a bundle to share one Team ID. The script re-signs everything ad-hoc
-   (Team ID `-`), inside out: binaries → nested bundles, deepest first → the bundle itself.
+3. **Code signing — which turns out not to need doing.** Every macOS port of this patch,
+   including earlier versions of this one, re-signs the whole bundle ad-hoc on the assumption
+   that patching invalidates the signature. It doesn't. Only `app.asar` (an unsigned resource)
+   and `Info.plist` change; no Mach-O binary is touched, so every executable keeps its
+   original signature and the app launches normally.
 
-   Signing is done with `--preserve-metadata=entitlements,flags,runtime`. Without it,
-   `codesign` silently strips the hardened runtime *and every entitlement* — including
-   `allow-jit` and the TCC-gated camera, microphone, location and photos entitlements. Since
-   the identity also changes from Anthropic's Team ID to ad-hoc, macOS would treat the result
-   as a different app and lose privacy permissions you had already granted. If the bundle
-   fails to verify with the runtime preserved, the script retries without it and says so,
-   rather than reporting success either way.
+   The re-signing never worked here anyway — every `codesign` call failed with `Operation not
+   permitted`, because a shell has no App Management right over another app's bundle, the same
+   restriction that forces the Finder workaround above. Those failures were hidden behind
+   `2>/dev/null`, so the step reported success while doing nothing.
+
+   So this patch doesn't re-sign, which is also the better outcome: the bundle keeps
+   Anthropic's real Developer ID signature and its hardened runtime, instead of being
+   downgraded to ad-hoc with its entitlements stripped. Instead, the last phase verifies what
+   actually matters — that the payload is in `app.asar`, that the integrity hash matches
+   `Info.plist`, and that the signature is still Anthropic's.
 
 ---
 
@@ -127,6 +132,11 @@ drag it over `/Applications/Claude.app`.
 - **Version-dependent.** The injection targets specific bundle paths
   (`.vite/build/mainView.js` and `MainWindowPage-*.js`). A future release could rename these,
   in which case the script reports that it found nothing to inject.
+- **`codesign --verify` will fail.** It reports `invalid Info.plist`, because rewriting the
+  ASAR integrity hash breaks the bundle's resource seal. This is expected and does not stop
+  the app from launching — macOS doesn't consult that seal for an already-installed,
+  unquarantined app. Gatekeeper would, so a fresh download or a quarantined copy is a
+  different matter.
 - **Artifact preview panes.** On a Hebrew-language macOS install, Chromium may give the UI an
   RTL layout of its own, independent of this patch. If artifact previews render mirrored, that
   is upstream Chromium behavior rather than the injected script — see
